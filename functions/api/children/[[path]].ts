@@ -1,44 +1,70 @@
 import { notFound, parseBucketPath } from "@/utils/bucket";
 import { get_list_auth_status } from "@/utils/auth";
-
+import { OneDriveClient, isOneDrivePath } from "@/utils/onedrive";
+ 
 export async function onRequestGet(context) {
   try {
     const [bucket, path] = parseBucketPath(context);
     const prefix = path && `${path}/`;
-    if (!bucket || prefix.startsWith("_$flaredrive$/")) return notFound();
-
+    
     // 检查文件列表访问权限
     const authResult = get_list_auth_status(context, path || "");
-
+    
     if (!authResult.hasAccess) {
-      // 没有权限访问，返回需要登录的响应（不包含WWW-Authenticate头，避免弹出浏览器登录框）
+      // 没有权限访问，返回需要登录的响应
       return new Response(JSON.stringify({
         needLogin: true,
         message: "需要登录才能查看文件列表"
       }), {
-        status: 200, // 改为200状态码，避免触发浏览器登录框
-        headers: {
-          "Content-Type": "application/json"
-        },
+        status: 200,
+        headers: { "Content-Type": "application/json" },
       });
     }
-
-    const objList = await bucket.list({
-      prefix,
-      delimiter: "/",
-      include: ["httpMetadata", "customMetadata"],
-    });
-
-    let objKeys = objList.objects
-      .filter((obj) => !obj.key.endsWith("/_$folder$"))
-      .map((obj) => {
-        const { key, size, uploaded, httpMetadata, customMetadata } = obj;
-        return { key, size, uploaded, httpMetadata, customMetadata };
+    
+    // 检查是否是OneDrive路径
+    if (isOneDrivePath(path)) {
+      try {
+        const oneDriveClient = new OneDriveClient(context.env);
+        const oneDriveItems = await oneDriveClient.listItems(path);
+        
+        return new Response(JSON.stringify({
+          value: oneDriveItems.files,
+          folders: oneDriveItems.folders,
+          isGuest: authResult.isGuest
+        }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      } catch (error) {
+        console.error("OneDrive列表获取错误:", error);
+        return new Response(JSON.stringify({
+          value: [],
+          folders: [],
+          error: error.message,
+          isGuest: authResult.isGuest
+        }), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    } else {
+      // 原有R2存储逻辑
+      if (!bucket || prefix.startsWith("_$flaredrive$/")) return notFound();
+      
+      const objList = await bucket.list({
+        prefix,
+        delimiter: "/",
+        include: ["httpMetadata", "customMetadata"],
       });
-
-    let folders = objList.delimitedPrefixes;
-    if (!path)
-      folders = folders.filter((folder) => folder !== "_$flaredrive$/");
+      
+      let objKeys = objList.objects
+        .filter((obj) => !obj.key.endsWith("/_$folder$"))
+        .map((obj) => {
+          const { key, size, uploaded, httpMetadata, customMetadata } = obj;
+          return { key, size, uploaded, httpMetadata, customMetadata };
+        });
+      
+      let folders = objList.delimitedPrefixes;
+      if (!path)
+        folders = folders.filter((folder) => folder !== "_$flaredrive$/");
 
     // 根据用户权限过滤内容
     if (!authResult.isGuest) {
@@ -105,13 +131,19 @@ export async function onRequestGet(context) {
       }
     }
 
-    return new Response(JSON.stringify({
-      value: objKeys,
-      folders,
-      isGuest: authResult.isGuest
-    }), {
-      headers: { "Content-Type": "application/json" },
-    });
+ // 添加特殊的OneDrive文件夹，如果在根目录
+      if (!path) {
+        folders.push("onedrive/");
+      }
+      
+      return new Response(JSON.stringify({
+        value: objKeys,
+        folders,
+        isGuest: authResult.isGuest
+      }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   } catch (e) {
     return new Response(e.toString(), { status: 500 });
   }
